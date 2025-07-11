@@ -7,11 +7,8 @@ from langchain.chat_models import init_chat_model
 from langchain_core.tools import tool, BaseTool
 from langchain_core.runnables import RunnableConfig
 from langchain_mcp_adapters.client import MultiServerMCPClient
-from langgraph.graph import MessagesState
 
-from langgraph.types import Command, Send
-from langgraph.graph import START, END, StateGraph
-
+from open_deep_research.state_manager import SingleStoreStateManager
 from open_deep_research.configuration import MultiAgentConfiguration
 from open_deep_research.utils import (
     get_config_value,
@@ -99,26 +96,22 @@ class FinishReport(BaseModel):
     """Finish the report."""
 
 ## State
-class ReportStateOutput(MessagesState):
+class ReportStateOutput(TypedDict):
     final_report: str # Final report
     # for evaluation purposes only
     # this is included only if configurable.include_source_str is True
     source_str: str # String of formatted source content from web search
 
-class ReportState(MessagesState):
-    sections: list[str] # List of report sections 
-    completed_sections: Annotated[list[Section], operator.add] # Send() API key
-    final_report: str # Final report
-    # for evaluation purposes only
-    # this is included only if configurable.include_source_str is True
-    source_str: Annotated[str, operator.add] # String of formatted source content from web search
+class ReportState(TypedDict):
+    sections: list[str]  # List of report sections
+    completed_sections: list[Section]
+    final_report: str
+    source_str: str
 
-class SectionState(MessagesState):
-    section: str # Report section  
-    completed_sections: list[Section] # Final key we duplicate in outer state for Send() API
-    # for evaluation purposes only
-    # this is included only if configurable.include_source_str is True
-    source_str: str # String of formatted source content from web search
+class SectionState(TypedDict):
+    section: str
+    completed_sections: list[Section]
+    source_str: str
 
 class SectionOutputState(TypedDict):
     completed_sections: list[Section] # Final key we duplicate in outer state for Send() API
@@ -237,7 +230,7 @@ async def supervisor(state: ReportState, config: RunnableConfig):
         ]
     }
 
-async def supervisor_tools(state: ReportState, config: RunnableConfig)  -> Command[Literal["supervisor", "research_team", "__end__"]]:
+async def supervisor_tools(state: ReportState, config: RunnableConfig)  -> dict:
     """Performs the tool call and sends to the research agent"""
     configurable = MultiAgentConfiguration.from_runnable_config(config)
 
@@ -277,7 +270,7 @@ async def supervisor_tools(state: ReportState, config: RunnableConfig)  -> Comma
             # Question tool was called - return to supervisor to ask the question
             question_obj = cast(Question, observation)
             result.append({"role": "assistant", "content": question_obj.question})
-            return Command(goto=END, update={"messages": result})
+            return {"messages": result, "end": True}
         elif tool_call["name"] == "Sections":
             sections_list = cast(Sections, observation).sections
         elif tool_call["name"] == "Introduction":
@@ -300,7 +293,7 @@ async def supervisor_tools(state: ReportState, config: RunnableConfig)  -> Comma
     # After processing all tool calls, decide what to do next
     if sections_list:
         # Send the sections to the research agents
-        return Command(goto=[Send("research_team", {"section": s}) for s in sections_list], update={"messages": result})
+        return {"messages": result, "sections": sections_list}
     elif intro_content:
         # Store introduction while waiting for conclusion
         # Append to messages to guide the LLM to write conclusion next
@@ -332,20 +325,20 @@ async def supervisor_tools(state: ReportState, config: RunnableConfig)  -> Comma
     if configurable.include_source_str and source_str:
         state_update["source_str"] = source_str
 
-    return Command(goto="supervisor", update=state_update)
+    state_update["goto"] = "supervisor"
+    return state_update
 
-async def supervisor_should_continue(state: ReportState) -> str:
+async def supervisor_should_continue(state: ReportState) -> bool:
     """Decide if we should continue the loop or stop based upon whether the LLM made a tool call"""
 
     messages = state["messages"]
     last_message = messages[-1]
     # End because the supervisor asked a question or is finished
-    if not last_message.tool_calls or (len(last_message.tool_calls) == 1 and last_message.tool_calls[0]["name"] == "FinishReport"):
-        # Exit the graph
-        return END
-
-    # If the LLM makes a tool call, then perform an action
-    return "supervisor_tools"
+    if not last_message.tool_calls or (
+        len(last_message.tool_calls) == 1 and last_message.tool_calls[0]["name"] == "FinishReport"
+    ):
+        return False
+    return True
 
 async def research_agent(state: SectionState, config: RunnableConfig):
     """LLM decides whether to call a tool or not"""
@@ -441,45 +434,57 @@ async def research_agent_tools(state: SectionState, config: RunnableConfig):
 
     return state_update
 
-async def research_agent_should_continue(state: SectionState) -> str:
+async def research_agent_should_continue(state: SectionState) -> bool:
     """Decide if we should continue the loop or stop based upon whether the LLM made a tool call"""
 
     messages = state["messages"]
     last_message = messages[-1]
 
     if last_message.tool_calls[0]["name"] == "FinishResearch":
-        # Research is done - return to supervisor
-        return END
-    else:
-        return "research_agent_tools"
+        return False
+    return True
     
-"""Build the multi-agent workflow"""
+async def run_multi_agent(
+    messages: list[dict],
+    config: dict,
+    manager: SingleStoreStateManager | None = None,
+) -> ReportState:
+    """Run the simplified multi-agent workflow sequentially."""
 
-# Research agent workflow
-research_builder = StateGraph(SectionState, output=SectionOutputState, config_schema=MultiAgentConfiguration)
-research_builder.add_node("research_agent", research_agent)
-research_builder.add_node("research_agent_tools", research_agent_tools)
-research_builder.add_edge(START, "research_agent") 
-research_builder.add_conditional_edges(
-    "research_agent",
-    research_agent_should_continue,
-    ["research_agent_tools", END]
-)
-research_builder.add_edge("research_agent_tools", "research_agent")
+    manager = manager or SingleStoreStateManager()
+    thread_id = config.get("thread_id", "default")
 
-# Supervisor workflow
-supervisor_builder = StateGraph(ReportState, input=MessagesState, output=ReportStateOutput, config_schema=MultiAgentConfiguration)
-supervisor_builder.add_node("supervisor", supervisor)
-supervisor_builder.add_node("supervisor_tools", supervisor_tools)
-supervisor_builder.add_node("research_team", research_builder.compile())
+    state: ReportState = {
+        "messages": messages,
+        "sections": [],
+        "completed_sections": [],
+        "final_report": "",
+        "source_str": "",
+    }
+    manager.save_report_state(thread_id, state)
 
-# Flow of the supervisor agent
-supervisor_builder.add_edge(START, "supervisor")
-supervisor_builder.add_conditional_edges(
-    "supervisor",
-    supervisor_should_continue,
-    ["supervisor_tools", END]
-)
-supervisor_builder.add_edge("research_team", "supervisor")
-
-graph = supervisor_builder.compile()
+    while True:
+        sup = await supervisor(state, {"configurable": config})
+        state.update(sup)
+        if not await supervisor_should_continue(state):
+            break
+        tool_res = await supervisor_tools(state, {"configurable": config})
+        state.update(tool_res)
+        if tool_res.get("end"):
+            break
+        for section in tool_res.get("sections", []):
+            sec_state: SectionState = {
+                "section": section,
+                "messages": [],
+                "completed_sections": [],
+            }
+            cont = True
+            while cont:
+                agent_res = await research_agent(sec_state, {"configurable": config})
+                sec_state.update(agent_res)
+                cont = await research_agent_should_continue(sec_state)
+                tools_res = await research_agent_tools(sec_state, {"configurable": config})
+                sec_state.update(tools_res)
+            state.setdefault("completed_sections", []).extend(sec_state.get("completed_sections", []))
+    manager.save_report_state(thread_id, state)
+    return state

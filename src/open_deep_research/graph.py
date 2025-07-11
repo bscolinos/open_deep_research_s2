@@ -4,19 +4,13 @@ from langchain.chat_models import init_chat_model
 from langchain_core.messages import HumanMessage, SystemMessage
 from langchain_core.runnables import RunnableConfig
 
-from langgraph.constants import Send
-from langgraph.graph import START, END, StateGraph
-from langgraph.types import interrupt, Command
-
+from open_deep_research.state_manager import SingleStoreStateManager
 from open_deep_research.state import (
-    ReportStateInput,
-    ReportStateOutput,
     Sections,
     ReportState,
     SectionState,
-    SectionOutputState,
     Queries,
-    Feedback
+    Feedback,
 )
 
 from open_deep_research.prompts import (
@@ -139,7 +133,7 @@ async def generate_report_plan(state: ReportState, config: RunnableConfig):
 
     return {"sections": sections}
 
-def human_feedback(state: ReportState, config: RunnableConfig) -> Command[Literal["generate_report_plan","build_section_with_web_research"]]:
+def human_feedback(state: ReportState, config: RunnableConfig) -> list[SectionState]:
     """Get human feedback on the report plan and route to next steps.
     
     This node:
@@ -154,7 +148,7 @@ def human_feedback(state: ReportState, config: RunnableConfig) -> Command[Litera
         config: Configuration for the workflow
         
     Returns:
-        Command to either regenerate plan or start section writing
+        List of section states to process
     """
 
     # Get sections
@@ -167,29 +161,20 @@ def human_feedback(state: ReportState, config: RunnableConfig) -> Command[Litera
         for section in sections
     )
 
-    # Get feedback on the report plan from interrupt
-    interrupt_message = f"""Please provide feedback on the following report plan. 
-                        \n\n{sections_str}\n
-                        \nDoes the report plan meet your needs?\nPass 'true' to approve the report plan.\nOr, provide feedback to regenerate the report plan:"""
-    
-    feedback = interrupt(interrupt_message)
-
-    # If the user approves the report plan, kick off section writing
-    if isinstance(feedback, bool) and feedback is True:
-        # Treat this as approve and kick off section writing
-        return Command(goto=[
-            Send("build_section_with_web_research", {"topic": topic, "section": s, "search_iterations": 0}) 
-            for s in sections 
-            if s.research
-        ])
-    
-    # If the user provides feedback, regenerate the report plan 
-    elif isinstance(feedback, str):
-        # Treat this as feedback and append it to the existing list
-        return Command(goto="generate_report_plan", 
-                       update={"feedback_on_report_plan": [feedback]})
-    else:
-        raise TypeError(f"Interrupt value of type {type(feedback)} is not supported.")
+    # In this simplified implementation we auto-approve the plan
+    return [
+        {
+            "topic": topic,
+            "section": s,
+            "search_iterations": 0,
+            "search_queries": [],
+            "source_str": "",
+            "report_sections_from_research": "",
+            "completed_sections": [],
+        }
+        for s in sections
+        if s.research
+    ]
     
 async def generate_queries(state: SectionState, config: RunnableConfig):
     """Generate search queries for researching a specific section.
@@ -265,7 +250,7 @@ async def search_web(state: SectionState, config: RunnableConfig):
 
     return {"source_str": source_str, "search_iterations": state["search_iterations"] + 1}
 
-async def write_section(state: SectionState, config: RunnableConfig) -> Command[Literal[END, "search_web"]]:
+async def write_section(state: SectionState, config: RunnableConfig) -> dict:
     """Write a section of the report and evaluate if more research is needed.
     
     This node:
@@ -280,7 +265,7 @@ async def write_section(state: SectionState, config: RunnableConfig) -> Command[
         config: Configuration for writing and evaluation
         
     Returns:
-        Command to either complete section or do more research
+        Dict with either updated search queries or completed section
     """
 
     # Get state 
@@ -344,14 +329,11 @@ async def write_section(state: SectionState, config: RunnableConfig) -> Command[
         update = {"completed_sections": [section]}
         if configurable.include_source_str:
             update["source_str"] = source_str
-        return Command(update=update, goto=END)
+        return update
 
     # Update the existing section with new content and update search queries
     else:
-        return Command(
-            update={"search_queries": feedback.follow_up_queries, "section": section},
-            goto="search_web"
-        )
+        return {"search_queries": feedback.follow_up_queries, "section": section}
     
 async def write_final_sections(state: SectionState, config: RunnableConfig):
     """Write sections that don't require research using completed sections as context.
@@ -448,56 +430,66 @@ def compile_final_report(state: ReportState, config: RunnableConfig):
     else:
         return {"final_report": all_sections}
 
-def initiate_final_section_writing(state: ReportState):
-    """Create parallel tasks for writing non-research sections.
-    
-    This edge function identifies sections that don't need research and
-    creates parallel writing tasks for each one.
-    
-    Args:
-        state: Current state with all sections and research context
-        
-    Returns:
-        List of Send commands for parallel section writing
-    """
+def initiate_final_section_writing(state: ReportState) -> list[SectionState]:
+    """Prepare states for non-research sections."""
 
-    # Kick off section writing in parallel via Send() API for any sections that do not require research
     return [
-        Send("write_final_sections", {"topic": state["topic"], "section": s, "report_sections_from_research": state["report_sections_from_research"]}) 
-        for s in state["sections"] 
+        {
+            "topic": state["topic"],
+            "section": s,
+            "report_sections_from_research": state["report_sections_from_research"],
+            "completed_sections": [],
+        }
+        for s in state["sections"]
         if not s.research
     ]
 
-# Report section sub-graph -- 
+async def run_graph(
+    topic: str,
+    config: dict,
+    manager: SingleStoreStateManager | None = None,
+) -> ReportState:
+    """Run the workflow sequentially using ``SingleStoreStateManager``."""
 
-# Add nodes 
-section_builder = StateGraph(SectionState, output=SectionOutputState)
-section_builder.add_node("generate_queries", generate_queries)
-section_builder.add_node("search_web", search_web)
-section_builder.add_node("write_section", write_section)
+    manager = manager or SingleStoreStateManager()
+    thread_id = config.get("thread_id", "default")
 
-# Add edges
-section_builder.add_edge(START, "generate_queries")
-section_builder.add_edge("generate_queries", "search_web")
-section_builder.add_edge("search_web", "write_section")
+    state: ReportState = {
+        "topic": topic,
+        "feedback_on_report_plan": [],
+        "sections": [],
+        "completed_sections": [],
+        "report_sections_from_research": "",
+        "final_report": "",
+        "source_str": "",
+    }
+    manager.save_report_state(thread_id, state)
 
-# Outer graph for initial report plan compiling results from each section -- 
+    result = await generate_report_plan(state, {"configurable": config})
+    state.update(result)
+    manager.save_report_state(thread_id, state)
 
-# Add nodes
-builder = StateGraph(ReportState, input=ReportStateInput, output=ReportStateOutput, config_schema=WorkflowConfiguration)
-builder.add_node("generate_report_plan", generate_report_plan)
-builder.add_node("human_feedback", human_feedback)
-builder.add_node("build_section_with_web_research", section_builder.compile())
-builder.add_node("gather_completed_sections", gather_completed_sections)
-builder.add_node("write_final_sections", write_final_sections)
-builder.add_node("compile_final_report", compile_final_report)
+    section_states = human_feedback(state, {"configurable": config})
+    for sec_state in section_states:
+        q = await generate_queries(sec_state, {"configurable": config})
+        sec_state.update(q)
+        search_res = await search_web(sec_state, {"configurable": config})
+        sec_state.update(search_res)
+        res = await write_section(sec_state, {"configurable": config})
+        sec_state.update(res)
+        state["completed_sections"].extend(sec_state.get("completed_sections", []))
+        manager.save_section_state(thread_id, sec_state["section"].name, sec_state)
 
-# Add edges
-builder.add_edge(START, "generate_report_plan")
-builder.add_edge("generate_report_plan", "human_feedback")
-builder.add_edge("build_section_with_web_research", "gather_completed_sections")
-builder.add_conditional_edges("gather_completed_sections", initiate_final_section_writing, ["write_final_sections"])
-builder.add_edge("write_final_sections", "compile_final_report")
-builder.add_edge("compile_final_report", END)
+    state.update(gather_completed_sections(state))
+    manager.save_report_state(thread_id, state)
 
-graph = builder.compile()
+    final_sections = initiate_final_section_writing(state)
+    for sec_state in final_sections:
+        res = await write_final_sections(sec_state, {"configurable": config})
+        sec_state.update(res)
+        state["completed_sections"].extend(res["completed_sections"])
+        manager.save_section_state(thread_id, sec_state["section"].name, sec_state)
+
+    state.update(compile_final_report(state, {"configurable": config}))
+    manager.save_report_state(thread_id, state)
+    return state

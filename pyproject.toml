@@ -9,7 +9,6 @@ readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 dependencies = [
-    "langgraph>=0.2.55",
     "langchain-community>=0.3.9",
     "langchain-openai>=0.3.7",
     "langchain-anthropic>=0.3.15",
@@ -35,7 +34,7 @@ dependencies = [
     "azure-search>=1.0.0b2",
     "azure-search-documents>=11.5.2",
     "rich>=13.0.0",
-    "langgraph-cli[inmem]>=0.3.1",
+    "singlestoredb>=0.1.0",
     "langsmith>=0.3.37",
 ]
 
