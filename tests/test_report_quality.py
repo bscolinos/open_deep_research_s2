@@ -13,12 +13,9 @@ from rich.table import Table
 from rich.text import Text
 from rich.markdown import Markdown
 
-from langgraph.checkpoint.memory import MemorySaver
-from langgraph.types import Command
-
-# Import the report generation agents
-from open_deep_research.graph import builder
-from open_deep_research.multi_agent import supervisor_builder
+from open_deep_research.graph import run_graph
+from open_deep_research.multi_agent import run_multi_agent
+from open_deep_research.state_manager import SingleStoreStateManager
 
 # Initialize rich console with force_terminal to ensure output even when pytest captures stdout
 console = Console(force_terminal=True, width=120)
@@ -171,41 +168,25 @@ def test_response_criteria_evaluation(research_agent, search_api, models, eval_m
         # Initial messages
         initial_msg = [{"role": "user", "content": "Give me a high-level overview of MCP (model context protocol). Keep the report to 3 main body sections. One section on the origins of MPC, one section on interesting examples of MCP servers, and one section on the future roadmap for MCP. Report should be written for a developer audience."}]
 
-        # Checkpointer for the multi-agent approach
-        checkpointer = MemorySaver()
-        graph = supervisor_builder.compile(checkpointer=checkpointer)
-
-        # Create configuration with the provided parameters
+        manager = SingleStoreStateManager()
         config = {
             "thread_id": str(uuid.uuid4()),
             "search_api": search_api,
             "supervisor_model": models.get("supervisor_model"),
             "researcher_model": models.get("researcher_model"),
-            "ask_for_clarification": False, # Don't ask for clarification from the user and proceed to write the report
-            "process_search_results": "summarize", # Optionally summarize 
+            "ask_for_clarification": False,
+            "process_search_results": "summarize",
         }
-        
-        thread_config = {"configurable": config}
-
-        # Run the workflow with asyncio
-        asyncio.run(graph.ainvoke({"messages": initial_msg}, config=thread_config))
-        
-        # Get the final state once both invocations are complete
-        final_state = graph.get_state(thread_config)
-        report = final_state.values.get('final_report', "No report generated")
-        console.print(f"[bold green]Report generated with length: {len(report)} characters[/bold green]")
+        report_state = asyncio.run(run_multi_agent(initial_msg, config, manager))
+        report = report_state.get("final_report", "No report generated")
 
     elif research_agent == "graph":
         
         # Topic query 
         topic_query = "Give me a high-level overview of MCP (model context protocol). Keep the report to 3 main body sections. One section on the origins of MPC, one section on interesting examples of MCP servers, and one section on the future roadmap for MCP. Report should be written for a developer audience."
    
-        # Checkpointer for the graph approach
-        checkpointer = MemorySaver()
-        graph = builder.compile(checkpointer=checkpointer)
-        
-        # Configuration for the graph agent with provided parameters
-        thread = {"configurable": {
+        manager = SingleStoreStateManager()
+        thread_config = {
             "thread_id": str(uuid.uuid4()),
             "search_api": search_api,
             "planner_provider": models.get("planner_provider", "anthropic"),
@@ -213,25 +194,9 @@ def test_response_criteria_evaluation(research_agent, search_api, models, eval_m
             "writer_provider": models.get("writer_provider", "anthropic"),
             "writer_model": models.get("writer_model", "claude-3-5-sonnet-latest"),
             "max_search_depth": models.get("max_search_depth", 2),
-        }}
-        
-        async def run_graph_agent(thread):    
-            # Run the graph until the interruption
-            async for event in graph.astream({"topic":topic_query}, thread, stream_mode="updates"):
-                if '__interrupt__' in event:
-                    interrupt_value = event['__interrupt__'][0].value
-
-            # Pass True to approve the report plan and proceed to write the report
-            async for event in graph.astream(Command(resume=True), thread, stream_mode="updates"):
-                # console.print(f"[dim]{event}[/dim]")
-                # console.print()
-                None
-            
-            final_state = graph.get_state(thread)
-            report = final_state.values.get('final_report', "No report generated")
-            return report
-    
-        report = asyncio.run(run_graph_agent(thread))
+        }
+        report_state = asyncio.run(run_graph(topic_query, thread_config, manager))
+        report = report_state.get("final_report", "No report generated")
 
     # Get evaluation LLM using the specified model
     criteria_eval_structured_llm = get_evaluation_llm(eval_model)

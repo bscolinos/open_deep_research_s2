@@ -23,7 +23,17 @@ Then edit the `.env` file to customize the environment variables (for model sele
 cp .env.example .env
 ```
 
-Launch the assistant with the LangGraph server locally, which will open in your browser:
+### Configure SingleStoreDB
+
+Set the `SINGLESTORE_URI` environment variable in your `.env` file. It should point to your database instance, for example:
+
+```
+SINGLESTORE_URI=mysql://user:password@localhost:3306/open_deep_research
+```
+
+The workflow will automatically create the required tables on first run.
+
+Run the assistant locally:
 
 #### Mac
 
@@ -31,23 +41,18 @@ Launch the assistant with the LangGraph server locally, which will open in your 
 # Install uv package manager
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Install dependencies and start the LangGraph server
-uvx --refresh --from "langgraph-cli[inmem]" --with-editable . --python 3.11 langgraph dev --allow-blocking
+# Install dependencies
+uv pip install -e .
 ```
 
 #### Windows / Linux
 
 ```powershell
-# Install dependencies 
+# Install dependencies
 pip install -e .
-pip install -U "langgraph-cli[inmem]" 
-
-# Start the LangGraph server
-langgraph dev
 ```
 
-Use this to open the Studio UI:
-```
+You can then run the workflow via the command line or integrate it in your own scripts.
 - 🚀 API: http://127.0.0.1:2024
 - 🎨 Studio UI: https://smith.langchain.com/studio/?baseUrl=http://127.0.0.1:2024
 - 📚 API Docs: http://127.0.0.1:2024/docs
@@ -432,8 +437,3 @@ Both evaluation systems complement each other and provide comprehensive coverage
 
 ### Local deployment
 
-Follow the [quickstart](#-quickstart) to start LangGraph server locally.
-
-### Hosted deployment
- 
-You can easily deploy to [LangGraph Platform](https://langchain-ai.github.io/langgraph/concepts/#deployment-options). 
