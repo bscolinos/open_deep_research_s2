@@ -36,6 +36,8 @@ dependencies = [
     "rich>=13.0.0",
     "singlestoredb>=0.1.0",
     "langsmith>=0.3.37",
+    "streamlit>=1.46.0",
+    "fpdf>=1.7.2",
 ]
 
 [project.optional-dependencies]
