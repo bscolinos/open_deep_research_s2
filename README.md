@@ -437,3 +437,12 @@ Both evaluation systems complement each other and provide comprehensive coverage
 
 ### Local deployment
 
+To try the assistant with a simple web interface, run the Streamlit app:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+Enter a question, wait for the research to complete, and then download the
+generated report as a PDF.
+
